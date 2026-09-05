@@ -1,0 +1,433 @@
+@tool
+class_name ArenaPlayer
+extends Node3D
+
+## One player: movement, weapons, health and hitboxes, assembled.
+##
+## [b]This is the piece every one of the addons says belongs in the game.[/b]
+## dot-fps-controller does not know about dot-combat; dot-combat does not know about
+## dot-match; none of them knows about the others' node layout. Something has to own
+## the wiring, and it is deliberately here rather than in an addon — an addon that did
+## it would be an addon that dictates a scene shape.
+##
+## Built in code rather than as a `.tscn` for the same reason [ArenaMap] is: the
+## headless test and the played game must get the same player, and a scene that is
+## instantiated in one and hand-built in the other is two players that drift.
+##
+## [codeblock]
+## var player := ArenaPlayer.new()
+## player.setup(ArenaPlayer.Mode.HEADLESS, map, session_id)
+## add_child(player)
+## player.give_loadout(loadout_entries)
+## [/codeblock]
+
+const CHANNEL := "arena.player"
+
+## Died. Carries the damage, so a caller has the killer and the weapon.
+signal died(damage: DotDamage)
+
+## Fired a shot. Before it is resolved, so a client can draw a tracer immediately.
+signal fired(shot: DotShot)
+
+## Spawned or respawned.
+signal spawned(at: Transform3D)
+
+## How the collision and tracing backends are chosen.
+enum Mode {
+	## Analytic geometry from [ArenaMap]. A dedicated server, and every test.
+	##
+	## Not a degraded mode: it is exact, it needs no physics space, and — the part
+	## that matters — it gives the same answer on a client replaying a tick and a
+	## server that ran it. See dot-fps-controller's `DotFpsFlatBody`.
+	HEADLESS,
+	## Godot physics. A client, and a listen server.
+	PHYSICS,
+}
+
+@export_group("Identity")
+
+## Stable id. A dot-server session id in a real deployment; an index in a test.
+##
+## The same value is the scoreboard key, the combat entity id and the damage
+## attribution, which is what stops three id spaces having to be mapped onto each
+## other at every seam.
+@export var player_id: int = 0
+
+@export var display_name: String = "Player"
+
+@export var team: int = 0
+
+var mode: Mode = Mode.HEADLESS
+
+var controller: DotFpsController = null
+var arsenal: DotArsenal = null
+var health: DotHealth = null
+var hitboxes: DotHitboxSet = null
+
+## Where the eyes are, and where shots start.
+var view: Node3D = null
+
+var _map: ArenaMap = null
+var _combat: DotCombatManager = null
+var _command := DotCombatCommand.new()
+var _tick_rate: int = 64
+
+
+## An arsenal whose shots are attributed to the player id rather than to a node.
+##
+## `DotArsenal.attacker_id()` defaults to its parent's instance id, which is a fourth
+## id space nobody else here uses. Overriding it is the documented seam, and it is what
+## keeps the scoreboard key, the combat entity id and the damage attribution one value.
+class PlayerArsenal extends DotArsenal:
+	var owner_id: int = 0
+
+	func attacker_id() -> int:
+		return owner_id
+
+
+## A [DotFpsController] that collides against analytic geometry rather than physics.
+##
+## `_make_body` is dot-fps-controller's documented seam for exactly this, and using it
+## is what lets the same [ArenaPlayer] run on a dedicated server with no physics space
+## and in a client with one.
+class HeadlessController extends DotFpsController:
+	var flat_body: DotFpsBody = null
+
+	func _make_body() -> DotFpsBody:
+		return flat_body
+
+
+## Builds the whole player. Call before adding to the tree.
+func setup(p_mode: Mode, map: ArenaMap, id: int, name_text: String = "") -> void:
+	mode = p_mode
+	_map = map
+	player_id = id
+
+	if name_text != "":
+		display_name = name_text
+
+	name = "Player%d" % id
+
+	_build_view()
+	_build_controller()
+	_build_health()
+	_build_arsenal()
+	_build_hitboxes()
+
+
+func _build_view() -> void:
+	view = Node3D.new()
+	view.name = "View"
+	# Eye height for a 1.8 m capsule, which is what the tunables below describe.
+	view.position = Vector3(0.0, 1.6, 0.0)
+	add_child(view)
+
+
+func _build_controller() -> void:
+	var tunables := arena_tunables()
+
+	if mode == Mode.HEADLESS:
+		var headless := HeadlessController.new()
+		headless.flat_body = _map.to_fps_body()
+		controller = headless
+	else:
+		controller = DotFpsController.new()
+
+	controller.name = "Movement"
+	controller.drive = DotFpsController.Drive.EXTERNAL
+	controller.tick_rate = _tick_rate
+	controller.tunables = tunables
+	controller.register_service = false
+	controller.register_default_actions = false
+	controller.body_ref = DotNodeRef.of_path(NodePath(".."))
+	add_child(controller)
+
+
+## Movement that feels like an arena shooter rather than a modern one.
+##
+## Fast, floaty, high air control, and no sprint — the speed is the speed, and the way
+## to go faster is to move well. Every number here is a game's choice; none of it is
+## dot-fps-controller's default.
+static func arena_tunables() -> DotFpsTunables:
+	var tunables := DotFpsTunables.new()
+	tunables.max_speed = 9.0
+	tunables.accelerate = 12.0
+	tunables.friction = 5.5
+	tunables.stop_speed = 3.0
+	# High air acceleration with a low wish-speed cap is the classic formula: it does
+	# nothing when you hold forward and everything when you turn while strafing.
+	tunables.air_accelerate = 140.0
+	tunables.max_air_wish_speed = 1.2
+	tunables.gravity = 22.0
+	tunables.jump_height = 1.25
+	tunables.auto_hop = true
+	tunables.coyote_time = 0.08
+	tunables.jump_buffer_time = 0.12
+	tunables.sprint_speed_scale = 1.0
+	tunables.crouch_speed_scale = 0.45
+	return tunables
+
+
+func _build_health() -> void:
+	health = DotHealth.new()
+	health.name = "Health"
+	health.max_health = 100.0
+	health.max_armour = 100.0
+	# No regeneration. An arena shooter's health is a resource you pick up, and
+	# regeneration turns every fight into a question of who disengages first.
+	health.regen_per_second = 0.0
+	health.set_tick_rate(_tick_rate)
+	add_child(health)
+
+	health.died.connect(_on_died)
+
+
+func _build_arsenal() -> void:
+	var owned := PlayerArsenal.new()
+	owned.owner_id = player_id
+	arsenal = owned
+
+	arsenal.name = "Arsenal"
+	arsenal.tick_rate = _tick_rate
+	arsenal.max_slots = 4
+	arsenal.muzzle_ref = DotNodeRef.of_path(NodePath("../View"))
+	add_child(arsenal)
+
+	arsenal.fired.connect(_on_fired)
+
+
+func _build_hitboxes() -> void:
+	hitboxes = DotHitboxSet.new()
+	hitboxes.name = "Hitboxes"
+	hitboxes.bounds_offset = Vector3(0.0, 0.9, 0.0)
+	hitboxes.bounds_radius = 1.6
+
+	var head := DotHitbox.new()
+	head.name = "Head"
+	head.group = DotHitGroup.HEAD
+	head.shape = DotHitbox.Shape.SPHERE
+	head.radius = 0.15
+	head.position = Vector3(0.0, 1.62, 0.0)
+	# Higher than the torso's, so the shared surface between a head sphere and a chest
+	# capsule resolves to the head every time rather than about half the time.
+	head.precedence = 10
+	hitboxes.add_child(head)
+
+	var chest := DotHitbox.new()
+	chest.name = "Chest"
+	chest.group = DotHitGroup.CHEST
+	chest.shape = DotHitbox.Shape.CAPSULE
+	chest.radius = 0.30
+	chest.height = 1.05
+	chest.position = Vector3(0.0, 0.98, 0.0)
+	hitboxes.add_child(chest)
+
+	var legs := DotHitbox.new()
+	legs.name = "Legs"
+	legs.group = DotHitGroup.LEG
+	legs.shape = DotHitbox.Shape.CAPSULE
+	legs.radius = 0.24
+	legs.height = 0.9
+	legs.position = Vector3(0.0, 0.45, 0.0)
+	hitboxes.add_child(legs)
+
+	add_child(hitboxes)
+	hitboxes.refresh()
+
+
+# --- Registration ----------------------------------------------------------
+
+## Registers with the combat manager so this player can shoot and be shot.
+##
+## Both halves matter and they are separate calls in dot-combat: hitboxes make you
+## hittable, health makes you damageable. A player with one and not the other is a
+## player shots pass through, or one who takes hits and never dies.
+func join_combat(combat: DotCombatManager) -> void:
+	_combat = combat
+	hitboxes.register_with(combat, player_id)
+	combat.register_health(player_id, health)
+	combat.set_authoritative_origin(player_id, muzzle_position())
+
+
+func leave_combat() -> void:
+	if _combat != null and is_instance_valid(_combat):
+		_combat.forget(player_id)
+	_combat = null
+
+
+# --- Loadout ---------------------------------------------------------------
+
+## Gives the weapons a resolved loadout names.
+##
+## [param entries] is what [method DotLoadoutManager.resolve] returns: dictionaries of
+## `slot`, `arsenal_slot`, `item` and `count`. dot-loadout never heard of `DotWeapon`
+## and dot-combat never heard of `DotItem`; this three-line loop is the entire join,
+## and it is here because it is the only place that knows both.
+func give_loadout(entries: Array[Dictionary]) -> void:
+	arsenal.clear()
+
+	var table := ArenaContent.weapon_table()
+	var lowest := 0
+
+	for entry in entries:
+		var item: DotItem = entry["item"]
+		var weapon: DotWeapon = table.get(item.id)
+
+		if weapon == null:
+			# An equipment item with no weapon behind it. Armour goes through here.
+			if item.id == &"armour":
+				health.add_armour(100.0)
+			continue
+
+		var slot := int(entry["arsenal_slot"])
+		arsenal.give(weapon, slot)
+
+		if lowest == 0 or slot > lowest:
+			lowest = slot
+
+	if lowest > 0:
+		arsenal.select(lowest, controller.state.tick)
+
+
+## The default loadout, for a player who has not chosen one.
+func give_default_loadout() -> void:
+	arsenal.clear()
+	arsenal.give(ArenaContent.pistol(), 1)
+	arsenal.give(ArenaContent.rifle(), 2)
+	arsenal.select(2, controller.state.tick)
+
+
+# --- Lifecycle -------------------------------------------------------------
+
+## Puts the player into the world alive and whole.
+func spawn(at: Transform3D, tick: int, protection_ticks: int = 0) -> void:
+	# teleport() takes the look angles, not a velocity: it zeroes the velocity itself
+	# and setting yaw afterwards would miss the sampler and the view, which it also
+	# snaps.
+	controller.teleport(at.origin, rad_to_deg(at.basis.get_euler().y), 0.0)
+
+	health.spawn_protection_ticks = protection_ticks
+	health.reset(tick)
+
+	arsenal.disabled = false
+	global_transform = at
+
+	if _combat != null:
+		_combat.set_authoritative_origin(player_id, muzzle_position())
+
+	spawned.emit(at)
+
+
+## Takes the player out of play without removing them.
+func make_dead() -> void:
+	arsenal.disabled = true
+	health.alive = false
+	hitboxes.enabled = false
+
+
+func is_alive() -> bool:
+	return health.alive
+
+
+# --- Simulation ------------------------------------------------------------
+
+## Advances the player one tick.
+##
+## [b]The order is not arbitrary.[/b] Movement runs first so the shot leaves from
+## where the player ends the tick rather than where they started it — half a tick of
+## movement at arena speeds is fifteen centimetres, which at range is a miss. The
+## arsenal's spread inputs are taken from the movement state afterwards, and the shots
+## come out last.
+##
+## Returns the shots produced, unresolved. The caller decides whether it is
+## authoritative enough to resolve them.
+func simulate_tick(
+	tick: int,
+	delta: float,
+	movement_command: DotFpsCommand,
+	combat_command: DotCombatCommand
+) -> Array[DotShot]:
+	if not health.alive:
+		return []
+
+	controller.apply_command(movement_command)
+	controller.simulate_tick(tick, delta)
+
+	var state := controller.state
+
+	# Pushed in from the simulated state, never read out of a rendered one: an
+	# interpolated position differs between client and server by design, and feeding it
+	# to the spread makes the spread differ too.
+	arsenal.movement = clampf(
+		state.horizontal_speed() / maxf(0.001, controller.tunables.max_speed), 0.0, 1.0
+	)
+	arsenal.airborne = not state.is_grounded()
+	arsenal.crouched = state.is_crouched()
+
+	# The aim comes from the movement command, not from a second sample. Sampling the
+	# mouse twice gives a shot that leaves at a different angle than the one the
+	# player was looking along.
+	_command = combat_command.duplicate_command()
+	_command.yaw = state.yaw
+	_command.pitch = state.pitch
+
+	health.tick(tick, delta)
+
+	if _combat != null:
+		_combat.set_authoritative_origin(player_id, muzzle_position())
+
+	return arsenal.simulate_tick(tick, delta, _command)
+
+
+## Where shots start: the eyes, not the feet.
+##
+## Read off the View node when there is one, because that is what `DotArsenal` uses to
+## place a shot — computing it a second way here would let the server's idea of the
+## muzzle drift from the one the shots actually came out of, and `_correct_origin`
+## would then relocate every legitimate shot.
+func muzzle_position() -> Vector3:
+	if view != null and view.is_inside_tree():
+		return view.global_position
+
+	return controller.state.position + Vector3(0.0, 1.6, 0.0)
+
+
+func aim_direction() -> Vector3:
+	return _command.aim_direction()
+
+
+## The current cone half-angle, for a crosshair.
+func spread_degrees() -> float:
+	var state := arsenal.current()
+	return 0.0 if state == null else state.spread_degrees(
+		arsenal.movement, arsenal.airborne, arsenal.crouched
+	)
+
+
+func _on_died(damage: DotDamage) -> void:
+	make_dead()
+	died.emit(damage)
+
+
+func _on_fired(shot: DotShot) -> void:
+	fired.emit(shot)
+
+
+func describe() -> Dictionary:
+	return {
+		"id": player_id,
+		"name": display_name,
+		"team": team,
+		"mode": Mode.keys()[mode],
+		"position": controller.state.position,
+		"health": health.describe(),
+		"arsenal": arsenal.describe(),
+	}
+
+
+func describe_lines() -> PackedStringArray:
+	var out := PackedStringArray()
+	out.append("%s (%d)  %s" % [display_name, player_id, "alive" if is_alive() else "dead"])
+	out.append_array(health.describe_lines())
+	out.append_array(arsenal.describe_lines())
+	return out

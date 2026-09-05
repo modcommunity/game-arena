@@ -1,0 +1,23 @@
+# Godot 4
+.godot/
+/android/
+
+# Every dot-* addon is a separate repository. For local development, symlink them:
+#   ln -s ../../dot-core/addons/dot_core addons/dot_core
+# A shipped build copies them in instead.
+/addons/dot_core
+/addons/dot_net
+/addons/dot_server
+/addons/dot_fps_controller
+/addons/dot_combat
+/addons/dot_loadout
+/addons/dot_match
+/addons/dot_ui
+
+# Exports
+build/
+export_presets.cfg
+
+# OS
+.DS_Store
+Thumbs.db
